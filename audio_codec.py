@@ -8,7 +8,7 @@ import heapq
 
 FS            = 44100   # sample rate
 DUR           = 3       # seconds for generated test signal
-MAX_AUDIO_SEC = 10      # max seconds to encode (keeps Huffman fast for large files)
+MAX_AUDIO_SEC = 45      # max seconds to encode
 
 
 # 1. Test signal generation
@@ -44,8 +44,12 @@ def _build_cb(data):
 
 # 3. Encoder
 
-def encode(wav_path, q_bits=6):
-    """STFT -> perceptual masking -> uniform quantise -> Huffman pack -> bytes."""
+def encode(wav_path, q_bits=6, cutoff_hz=None):
+    """STFT -> perceptual masking -> uniform quantise -> Huffman pack -> bytes.
+
+    cutoff_hz: if given, apply a hard low-pass at that frequency instead of
+               the default 55th-percentile energy masking.
+    """
     fs, raw = wavfile.read(wav_path)
     if raw.ndim > 1:
         raw = raw[:, 0]
@@ -59,8 +63,14 @@ def encode(wav_path, q_bits=6):
     _, _, Z = stft(sig, fs=fs, nperseg=1024, noverlap=768)
     mag, phase = np.abs(Z), np.angle(Z)
 
-    # perceptual masking: zero coefficients below the 55th-percentile energy
-    mag[mag < np.percentile(mag, 55)] = 0.0
+    # Perceptual masking
+    if cutoff_hz is not None:
+        # Hard low-pass: zero all STFT bins above cutoff_hz
+        cutoff_bin = int(cutoff_hz * 1024 / fs)
+        mag[cutoff_bin:, :] = 0.0
+    else:
+        # Default: zero coefficients below the 55th-percentile energy
+        mag[mag < np.percentile(mag, 55)] = 0.0
 
     # uniform quantisation to q_bits levels
     levels = 2 ** q_bits

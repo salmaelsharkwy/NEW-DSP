@@ -1,4 +1,4 @@
-# video_codec.py -- I-frame / P-frame video compression
+# video_codec.py  –  basic video compressor (I-frames + P-frames)
 import numpy as np
 import cv2
 import pickle
@@ -140,7 +140,7 @@ def _motion_est(curr, ref, bsize=16, sr=4):
         for c in range(0, w, bsize):
             if r + bsize > h or c + bsize > w: continue
             blk = curr[r: r+bsize, c: c+bsize].astype(np.int16)
-            best_mv, best_sad = (0, 0), float('inf')
+            best_mv, best_sad = (0, 0), float('inf')  # SAD = Sum of Absolute Differences
             for dy in range(-sr, sr + 1):
                 for dx in range(-sr, sr + 1):
                     rr, cc = r + dy, c + dx
@@ -165,58 +165,19 @@ def _dec_pframe(mvs, flat, ref_y, bsize, n_blocks):
                 ref_y[rr: rr+bsize, cc: cc+bsize].astype(np.int16) + res)
     return np.clip(y, 0, 255).astype(np.uint8)
 
-def read_yuv_frames(path, width, height, fmt='420'):
-    ext = path.lower().rsplit('.', 1)[-1]
-    if ext == 'y4m':
-        cap = cv2.VideoCapture(path); frames = []
-        while True:
-            ret, bgr = cap.read()
-            if not ret: break
-            frames.append(bgr)
-        cap.release()
-        if not frames: raise RuntimeError("Could not read Y4M file: " + path)
-        return frames
-    if width <= 0 or height <= 0:
-        raise RuntimeError("For .yuv files you must enter Width and Height in the GUI.")
-    if fmt == '420':   frame_bytes = width * height * 3 // 2
-    elif fmt == '422': frame_bytes = width * height * 2
-    else:              frame_bytes = width * height * 3
-    data = open(path, 'rb').read(); n = len(data) // frame_bytes
-    if n == 0: raise RuntimeError("No complete YUV frames found. Check width/height/format.")
-    frames = []
-    for i in range(n):
-        chunk = np.frombuffer(data[i*frame_bytes:(i+1)*frame_bytes], np.uint8)
-        if fmt == '420':
-            yuv_np = chunk.reshape((height * 3 // 2, width))
-            bgr = cv2.cvtColor(yuv_np, cv2.COLOR_YUV2BGR_I420)
-        elif fmt == '422':
-            yuv_np = chunk.reshape((height, width * 2))
-            bgr = cv2.cvtColor(yuv_np, cv2.COLOR_YUV2BGR_Y422)
-        else:
-            yuv_np = chunk.reshape((height, width, 3))
-            bgr = cv2.cvtColor(yuv_np, cv2.COLOR_YCrCb2BGR)
-        frames.append(bgr)
-    return frames
-
-def _collect_bgr_frames(vid_path, yuv_w, yuv_h, yuv_fmt):
-    ext = vid_path.lower().rsplit('.', 1)[-1]
-    MAX_FRAMES = 60; MAX_W, MAX_H = 480, 272
+def _collect_bgr_frames(vid_path):
+    MAX_FRAMES = 90; MAX_W, MAX_H = 480, 272
     def resize_bgr(bgr):
         th = min(bgr.shape[0], MAX_H); tw = min(bgr.shape[1], MAX_W)
         th = max((th // 16) * 16, 16); tw = max((tw // 16) * 16, 16)
         return cv2.resize(bgr, (tw, th))
-    if ext in ('yuv', 'y4m'):
-        all_bgr = read_yuv_frames(vid_path, yuv_w, yuv_h, yuv_fmt)
-        step = max(1, len(all_bgr) // MAX_FRAMES)
-        frames = [resize_bgr(f) for f in all_bgr[::step]][:MAX_FRAMES]
-        return frames, 25.0
     cap = cv2.VideoCapture(vid_path, cv2.CAP_ANY)
     if not cap.isOpened(): cap = cv2.VideoCapture(vid_path)
     if not cap.isOpened():
         raise RuntimeError("Cannot open video: " + vid_path + "  Tip: convert to H.264 .mp4 with VLC.")
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 9999
-    step = max(1, total // MAX_FRAMES)
+    step  = max(1, total // MAX_FRAMES)
     frames, fi = [], 0
     while len(frames) < MAX_FRAMES:
         ret, bgr = cap.read()
@@ -230,9 +191,8 @@ def _collect_bgr_frames(vid_path, yuv_w, yuv_h, yuv_fmt):
         raise RuntimeError("No frames decoded. Convert to H.264 .mp4 with VLC and retry.")
     return frames, fps
 
-def encode_video(vid_path, gop=10, quality=75, yuv_w=0, yuv_h=0, yuv_fmt='420',
-                 progress_cb=None):
-    bgr_frames, fps = _collect_bgr_frames(vid_path, yuv_w, yuv_h, yuv_fmt)
+def encode_video(vid_path, gop=10, quality=75, progress_cb=None):
+    bgr_frames, fps = _collect_bgr_frames(vid_path)
     Q = _qmat(quality); bsize = 16
     raw_frames = []; orig_frames = []; ref_y = None
     total = len(bgr_frames)
@@ -248,24 +208,40 @@ def encode_video(vid_path, gop=10, quality=75, yuv_w=0, yuv_h=0, yuv_fmt='420',
             blocks = _enc_iframe(y_ch, Q)
             raw_frames.append(('I', blocks, u_s, v_s)); ref_y = y_ch.copy()
         else:
-            # sr=2: 5x5=25 search positions (vs sr=4: 81) -- 3x faster
-            mvs, residuals = _motion_est(y_ch, ref_y, bsize=bsize, sr=2)
+            # small search radius = faster encoding
+            mvs, residuals = _motion_est(y_ch, ref_y, bsize=bsize, sr=1)
             flat = [v for res in residuals for v in res]; nb = len(mvs)
             raw_frames.append(('P', mvs, flat, bsize, nb, u_s, v_s))
             ref_y = _dec_pframe(mvs, flat[:], ref_y, bsize, nb)
-    all_res = [v for fd in raw_frames if fd[0] == 'P' for v in fd[2]]
+    # collect all residual values and build one Huffman table
+    all_res = []
+    all_mvs = []
+    for fd in raw_frames:
+        if fd[0] == 'P':
+            all_res.extend(fd[2])
+            for mv in fd[1]:
+                all_mvs.extend(mv)
     global_cb = _huff_build(all_res) if all_res else {0: "0"}
+    mv_cb     = _huff_build(all_mvs) if all_mvs else {0: "0"}
+
     frames_data = []
     for fd in raw_frames:
         if fd[0] == 'I':
             frames_data.append(fd)
         else:
             _, mvs, flat, bsize_f, nb, u_s, v_s = fd
-            enc, pad = _huff_enc(flat, global_cb)
-            frames_data.append(('P', mvs, enc, pad, bsize_f, nb, u_s, v_s))
+            # Huffman encode residuals and motion vectors
+            enc_res, pad_res = _huff_enc(flat, global_cb)
+            mvs_flat = []
+            for mv in mvs:
+                mvs_flat.extend(mv)
+            enc_mv, pad_mv = _huff_enc(mvs_flat, mv_cb)
+            frames_data.append(('P', enc_mv, pad_mv, enc_res, pad_res,
+                                 bsize_f, nb, u_s, v_s))
+
     h, w = orig_frames[0].shape[:2]
     payload = {'fps': fps, 'h': h, 'w': w, 'Q': Q, 'gop': gop,
-               'global_cb': global_cb, 'frames': frames_data}
+               'global_cb': global_cb, 'mv_cb': mv_cb, 'frames': frames_data}
     bs = pickle.dumps(payload, protocol=4)
     orig_bytes = len(orig_frames) * h * w * 3
     return bs, orig_frames, orig_bytes
@@ -273,14 +249,19 @@ def encode_video(vid_path, gop=10, quality=75, yuv_w=0, yuv_h=0, yuv_fmt='420',
 def decode_video(bs):
     data = pickle.loads(bs)
     Q = data['Q']; h, w = data['h'], data['w']
-    rev_cb = {v: k for k, v in data['global_cb'].items()}
+    rev_cb    = {v: k for k, v in data['global_cb'].items()}
+    rev_mv_cb = {v: k for k, v in data['mv_cb'].items()}
     recon = []; ref_y = None
     for fd in data['frames']:
         if fd[0] == 'I':
             _, blocks, u_s, v_s = fd; y_ch = _dec_iframe(blocks, h, w, Q)
         else:
-            _, mvs, enc, pad, bsize, nb, u_s, v_s = fd
-            flat = _huff_dec(enc, rev_cb, pad, nb * bsize * bsize)
+            _, enc_mv, pad_mv, enc_res, pad_res, bsize, nb, u_s, v_s = fd
+            # Huffman-decode motion vectors then re-pair into (dy, dx) tuples
+            mvs_flat = _huff_dec(enc_mv, rev_mv_cb, pad_mv, nb * 2)
+            mvs = [(mvs_flat[i * 2], mvs_flat[i * 2 + 1]) for i in range(nb)]
+            # Huffman-decode residuals
+            flat = _huff_dec(enc_res, rev_cb, pad_res, nb * bsize * bsize)
             y_ch = _dec_pframe(mvs, flat, ref_y, bsize, nb)
         u_full = np.repeat(np.repeat(u_s, 2, axis=0), 2, axis=1)[:h, :w]
         v_full = np.repeat(np.repeat(v_s, 2, axis=0), 2, axis=1)[:h, :w]
